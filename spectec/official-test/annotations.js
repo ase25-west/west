@@ -1,0 +1,470 @@
+
+'use strict';
+
+if (typeof console === 'undefined') {
+  var Console = function () {
+      this.log = function(msg) { debug(msg); };
+  };
+  var console = new Console();
+}
+
+let hostrefs = {};
+let hostsym = Symbol("hostref");
+function hostref(s) {
+  if (! (s in hostrefs)) hostrefs[s] = {[hostsym]: s};
+  return hostrefs[s];
+}
+function eq_ref(x, y) {
+  return x === y ? 1 : 0;
+}
+
+let spectest = {
+  hostref: hostref,
+  eq_ref: eq_ref,
+  print: console.log.bind(console),
+  print_i32: console.log.bind(console),
+  print_i64: console.log.bind(console),
+  print_i32_f32: console.log.bind(console),
+  print_f64_f64: console.log.bind(console),
+  print_f32: console.log.bind(console),
+  print_f64: console.log.bind(console),
+  global_i32: 666,
+  global_i64: 666n,
+  global_f32: 666.6,
+  global_f64: 666.6,
+  table: new WebAssembly.Table({initial: 10, maximum: 20, element: 'anyfunc'}),
+  memory: new WebAssembly.Memory({initial: 1, maximum: 2})
+};
+
+let handler = {
+  get(target, prop) {
+    return (prop in target) ?  target[prop] : {};
+  }
+};
+let registry = new Proxy({spectest}, handler);
+
+function register(name, instance) {
+  registry[name] = instance.exports;
+}
+
+function module(bytes, valid = true) {
+  let buffer = new ArrayBuffer(bytes.length);
+  let view = new Uint8Array(buffer);
+  for (let i = 0; i < bytes.length; ++i) {
+    view[i] = bytes.charCodeAt(i);
+  }
+  let validated;
+  try {
+    validated = WebAssembly.validate(buffer);
+  } catch (e) {
+    throw new Error("Wasm validate throws");
+  }
+  if (validated !== valid) {
+    if (!validated) WebAssembly.compile(buffer).catch(e => console.log(e));
+    throw new Error("Wasm validate failure" + (valid ? "" : " expected"));
+  }
+  return new WebAssembly.Module(buffer);
+}
+
+function instance(mod, imports = registry) {
+  return new WebAssembly.Instance(mod, imports);
+}
+
+function call(instance, name, args) {
+  return instance.exports[name](...args);
+}
+
+function get(instance, name) {
+  let v = instance.exports[name];
+  return (v instanceof WebAssembly.Global) ? v.value : v;
+}
+
+function exports(instance) {
+  return {module: instance.exports, spectest: spectest};
+}
+
+function run(action) {
+  action();
+}
+
+function assert_malformed(bytes) {
+  try { module(bytes, false) } catch (e) {
+    if (e instanceof WebAssembly.CompileError) return;
+  }
+  throw new Error("Wasm decoding failure expected");
+}
+
+function assert_malformed_custom(bytes) {
+  return;
+}
+
+function assert_invalid(bytes) {
+  try { module(bytes, false) } catch (e) {
+    if (e instanceof WebAssembly.CompileError) return;
+  }
+  throw new Error("Wasm validation failure expected");
+}
+
+function assert_invalid_custom(bytes) {
+  return;
+}
+
+function assert_unlinkable(mod) {
+  try { new WebAssembly.Instance(mod, registry) } catch (e) {
+    if (e instanceof WebAssembly.LinkError) return;
+  }
+  throw new Error("Wasm linking failure expected");
+}
+
+function assert_uninstantiable(mod) {
+  try { new WebAssembly.Instance(mod, registry) } catch (e) {
+    if (e instanceof WebAssembly.RuntimeError) return;
+    throw new Error("Wasm trap expected, but got: " + e);
+  }
+  throw new Error("Wasm trap expected");
+}
+
+function assert_uninstantiable_inlined(bytes) {
+  let mod = module(bytes);
+  assert_uninstantiable(mod);
+}
+
+function assert_trap(action) {
+  try { action() } catch (e) {
+    if (e instanceof WebAssembly.RuntimeError) return;
+    throw new Error("Wasm trap expected, but got: " + e);
+  }
+  throw new Error("Wasm trap expected");
+}
+
+function assert_exception(action) {
+  try { action() } catch (e) { return; }
+  throw new Error("exception expected");
+}
+
+let StackOverflow;
+try { (function f() { 1 + f() })() } catch (e) { StackOverflow = e.constructor }
+
+function assert_exhaustion(action) {
+  try { action() } catch (e) {
+    if (e instanceof StackOverflow) return;
+  }
+  throw new Error("Wasm resource exhaustion expected");
+}
+
+function assert_return(action, ...expected) {
+  let actual = action();
+  if (actual === undefined) {
+    actual = [];
+  } else if (!Array.isArray(actual)) {
+    actual = [actual];
+  }
+  if (actual.length !== expected.length) {
+    throw new Error(expected.length + " value(s) expected, got " + actual.length);
+  }
+  for (let i = 0; i < actual.length; ++i) {
+    switch (expected[i]) {
+      case "nan:canonical":
+      case "nan:arithmetic":
+      case "nan:any":
+        // Note that JS can't reliably distinguish different NaN values,
+        // so there's no good way to test that it's a canonical NaN.
+        if (!Number.isNaN(actual[i])) {
+          throw new Error("Wasm NaN return value expected, got " + actual[i]);
+        };
+        return;
+      case "ref.i31":
+        if (typeof actual[i] !== "number" || (actual[i] & 0x7fffffff) !== actual[i]) {
+          throw new Error("Wasm i31 return value expected, got " + actual[i]);
+        };
+        return;
+      case "ref.any":
+      case "ref.eq":
+      case "ref.struct":
+      case "ref.array":
+        // For now, JS can't distinguish exported Wasm GC values,
+        // so we only test for object.
+        if (typeof actual[i] !== "object") {
+          throw new Error("Wasm object return value expected, got " + actual[i]);
+        };
+        return;
+      case "ref.func":
+        if (typeof actual[i] !== "function") {
+          throw new Error("Wasm function return value expected, got " + actual[i]);
+        };
+        return;
+      case "ref.extern":
+        if (actual[i] === null) {
+          throw new Error("Wasm reference return value expected, got " + actual[i]);
+        };
+        return;
+      case "ref.null":
+        if (actual[i] !== null) {
+          throw new Error("Wasm null return value expected, got " + actual[i]);
+        };
+        return;
+      default:
+        if (!Object.is(actual[i], expected[i])) {
+          throw new Error("Wasm return value " + expected[i] + " expected, got " + actual[i]);
+        };
+    }
+  }
+}
+
+// annotations.wast:1
+let $$1 = module("\x00\x61\x73\x6d\x01\x00\x00\x00");
+
+// annotations.wast:1
+let $1 = instance($$1);
+
+// annotations.wast:23
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:24
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:25
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:26
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:27
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:28
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:29
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:30
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:31
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:32
+let $$2 = module("\x00\x61\x73\x6d\x01\x00\x00\x00");
+
+// annotations.wast:32
+let $2 = instance($$2);
+
+// annotations.wast:33
+let $$3 = module("\x00\x61\x73\x6d\x01\x00\x00\x00");
+
+// annotations.wast:33
+let $3 = instance($$3);
+
+// annotations.wast:34
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:35
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:36
+let $$4 = module("\x00\x61\x73\x6d\x01\x00\x00\x00");
+
+// annotations.wast:36
+let $4 = instance($$4);
+
+// annotations.wast:37
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:38
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:39
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:40
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:41
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:42
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:43
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:44
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:45
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:46
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:47
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:48
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:49
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:50
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:51
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:52
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:53
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:54
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:55
+let $$5 = module("\x00\x61\x73\x6d\x01\x00\x00\x00");
+
+// annotations.wast:55
+let $5 = instance($$5);
+
+// annotations.wast:56
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:57
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:58
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:59
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:60
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:61
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:62
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:63
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:64
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:65
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:66
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:67
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:68
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:70
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:72
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:73
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:74
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:75
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:76
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:77
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:78
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:79
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:81
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:82
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:83
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:84
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:86
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:87
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:88
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:89
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:91
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:92
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:94
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:95
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:96
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// annotations.wast:98
+let $$6 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x86\x80\x80\x80\x00\x01\x60\x02\x7f\x7d\x00\x02\xd9\x80\x80\x80\x00\x04\x08\x73\x70\x65\x63\x74\x65\x73\x74\x0a\x67\x6c\x6f\x62\x61\x6c\x5f\x69\x33\x32\x03\x7f\x00\x08\x73\x70\x65\x63\x74\x65\x73\x74\x05\x74\x61\x62\x6c\x65\x01\x70\x01\x0a\x14\x08\x73\x70\x65\x63\x74\x65\x73\x74\x06\x6d\x65\x6d\x6f\x72\x79\x02\x01\x01\x02\x08\x73\x70\x65\x63\x74\x65\x73\x74\x0d\x70\x72\x69\x6e\x74\x5f\x69\x33\x32\x5f\x66\x33\x32\x00\x00\x07\x91\x80\x80\x80\x00\x04\x01\x67\x03\x00\x01\x74\x01\x00\x01\x6d\x02\x00\x01\x66\x00\x00");
+let $m = $$6;
+
+// annotations.wast:98
+let $6 = instance($m);
+let m = $6;
+
+// annotations.wast:129
+let $$7 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x86\x80\x80\x80\x00\x01\x60\x02\x7f\x7d\x00\x02\xd9\x80\x80\x80\x00\x04\x08\x73\x70\x65\x63\x74\x65\x73\x74\x0a\x67\x6c\x6f\x62\x61\x6c\x5f\x69\x33\x32\x03\x7f\x00\x08\x73\x70\x65\x63\x74\x65\x73\x74\x05\x74\x61\x62\x6c\x65\x01\x70\x01\x0a\x14\x08\x73\x70\x65\x63\x74\x65\x73\x74\x06\x6d\x65\x6d\x6f\x72\x79\x02\x01\x01\x02\x08\x73\x70\x65\x63\x74\x65\x73\x74\x0d\x70\x72\x69\x6e\x74\x5f\x69\x33\x32\x5f\x66\x33\x32\x00\x00\x07\x91\x80\x80\x80\x00\x04\x01\x67\x03\x00\x01\x74\x01\x00\x01\x6d\x02\x00\x01\x66\x00\x00");
+let $m1 = $$7;
+
+// annotations.wast:129
+let $7 = instance($m1);
+let m1 = $7;
+
+// annotations.wast:154
+let $$8 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x8b\x80\x80\x80\x00\x02\x60\x03\x7f\x7e\x7f\x01\x7f\x60\x00\x00\x03\x83\x80\x80\x80\x00\x02\x00\x01\x04\x85\x80\x80\x80\x00\x01\x70\x01\x0a\x14\x05\x84\x80\x80\x80\x00\x01\x01\x01\x02\x06\x86\x80\x80\x80\x00\x01\x7f\x00\x41\x2a\x0b\x07\x91\x80\x80\x80\x00\x04\x01\x67\x03\x00\x01\x74\x01\x00\x01\x6d\x02\x00\x01\x66\x00\x00\x08\x81\x80\x80\x80\x00\x01\x09\x89\x80\x80\x80\x00\x01\x00\x41\x00\x0b\x03\x00\x00\x00\x0a\x99\x80\x80\x80\x00\x02\x8c\x80\x80\x80\x00\x01\x03\x7f\x02\x7f\x20\x02\x20\x00\x6a\x0b\x0b\x82\x80\x80\x80\x00\x00\x0b\x0b\x8a\x80\x80\x80\x00\x01\x00\x41\x00\x0b\x04\x62\x6c\x61\x43");
+let $m2 = $$8;
+
+// annotations.wast:154
+let $8 = instance($m2);
+let m2 = $8;
+
+// annotations.wast:206
+let $$9 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x84\x80\x80\x80\x00\x01\x60\x00\x00\x03\x82\x80\x80\x80\x00\x01\x00\x0a\x88\x80\x80\x80\x00\x01\x82\x80\x80\x80\x00\x00\x0b");
+
+// annotations.wast:206
+let $9 = instance($$9);
+
+// annotations.wast:207
+let $$10 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x84\x80\x80\x80\x00\x01\x60\x00\x00\x03\x82\x80\x80\x80\x00\x01\x00\x0a\x88\x80\x80\x80\x00\x01\x82\x80\x80\x80\x00\x00\x0b");
+
+// annotations.wast:207
+let $10 = instance($$10);

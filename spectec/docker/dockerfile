@@ -1,0 +1,177 @@
+FROM ubuntu:20.04
+
+RUN apt-get update --fix-missing
+RUN apt-get upgrade --yes
+RUN apt install cmake --yes
+RUN apt install curl --yes
+RUN apt install wget
+RUN apt-get install git make vim --yes
+RUN apt-get install python3 python3-pip --yes
+
+# Installing OCaml
+#   - opam v2.0.5
+#   - OCaml v5.0.0
+#   - dune v3.10.0
+#   - menhir v20230608
+
+RUN apt-get install opam libgmp-dev pkg-config --yes
+RUN opam init --disable-sandboxing
+RUN opam switch create 5.0.0
+RUN opam install dune menhir zarith --yes # ocamlbuild
+RUN eval $(opam config env)
+
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="${PATH}:/root/.cargo/bin"
+
+# Previously in wasmer
+RUN apt update && apt install libc6 -y
+
+# Previously in v8
+RUN apt-get install lsb-release sudo -y
+
+# Previously in JavascriptCore
+RUN apt-get install libicu-dev python ruby bison flex build-essential ninja-build gperf -y
+RUN apt-get install software-properties-common -y
+RUN add-apt-repository ppa:ubuntu-toolchain-r/test
+RUN apt-get install gcc-11 g++-11 libssl-dev -y
+
+# Previously in SpiderMonkey
+RUN apt-get install expect -y
+
+
+WORKDIR /root
+
+
+# SSH setting
+
+RUN mkdir /root/.ssh
+RUN ssh-keyscan github.com >> /root/.ssh/known_hosts
+
+# Install west
+
+RUN git clone git@github.com:ase25-west/west.git
+
+
+# 1. Install wasmtime
+
+# RUN curl https://wasmtime.dev/install.sh -sSf | bash
+
+# Replace with the desired version
+ENV WASMTIME_BRANCH="main"
+RUN git clone --branch ${WASMTIME_BRANCH} --depth 1 https://github.com/bytecodealliance/wasmtime.git
+WORKDIR wasmtime
+RUN git submodule update --init --recursive
+RUN git fetch --depth=1 --no-tags origin 2c2e7cf78d46d3b554e75f2ccc1e83e23c21b88c
+RUN git reset --hard 2c2e7cf78d46d3b554e75f2ccc1e83e23c21b88c
+RUN cargo build --release
+ENV PATH="${PATH}:/root/wasmtime/target/release"
+
+
+# 2. Install wasmer
+
+# Download wasmer
+ENV WASMER_VERSION="v4.4.0"
+RUN curl https://get.wasmer.io -sSfL | sh -s ${WASMER_VERSION}
+ENV WASMER_DIR="/root/.wasmer"
+ENV WASMER_CACHE_DIR="$WASMER_DIR/cache"
+ENV PATH="${PATH}:$WASMER_DIR/bin"
+
+# 3. Install wasmedge
+
+# DEPRECATED
+
+# 4. Install V8
+
+WORKDIR /root
+RUN git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
+ENV PATH=/root/depot_tools:$PATH
+RUN gclient
+RUN mkdir /root/v8
+WORKDIR /root/v8
+ENV TAR_OPTIONS=--no-same-owner
+RUN fetch v8
+WORKDIR /root/v8/v8
+RUN git checkout 4c7d4354137c6500153317d5e562970dfd1fef78
+RUN gclient sync
+RUN tools/dev/gm.py x64.release
+
+
+# 5. Install JavaScriptCore
+
+WORKDIR /root
+RUN git config --global http.postBuffer 1000000000
+RUN git clone --depth=1 --no-tags https://github.com/WebKit/WebKit.git WebKit --progress
+WORKDIR /root/WebKit
+RUN git fetch --depth=1 --no-tags origin 9d02067f5de4b0402f58d6c83039e206439a8a8c
+RUN git reset --hard 9d02067f5de4b0402f58d6c83039e206439a8a8c
+WORKDIR /root
+# cloning takes too long (about 1hr)
+RUN add-apt-repository ppa:ubuntu-toolchain-r/test
+RUN apt-get update
+RUN apt-get install gcc-11 g++-11 -y
+RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-11 110 --slave /usr/bin/g++ g++ /usr/bin/g++-11
+RUN update-alternatives --config gcc
+
+# Download cmake v3.31.7
+ENV CMAKE_VERSION="3.31.7"
+RUN wget https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}.tar.gz
+RUN tar -zxvf cmake-${CMAKE_VERSION}.tar.gz
+WORKDIR cmake-${CMAKE_VERSION}
+RUN ./bootstrap
+RUN make
+RUN make install
+
+# Download and build ICU 70.1
+WORKDIR /opt
+RUN wget https://github.com/unicode-org/icu/releases/download/release-70-1/icu4c-70_1-src.tgz && \
+    tar -xzf icu4c-70_1-src.tgz && \
+    cd icu/source && \
+    ./configure --prefix=/opt/icu70 && \
+    make -j$(nproc) && \
+    make install
+
+# Set environment variables so CMake can find ICU
+ENV ICU_ROOT=/opt/icu70
+ENV PATH="/opt/icu70/bin:$PATH"
+ENV LD_LIBRARY_PATH="/opt/icu70/lib:$LD_LIBRARY_PATH"
+ENV PKG_CONFIG_PATH="/opt/icu70/lib/pkgconfig:$PKG_CONFIG_PATH"
+
+RUN /root/WebKit/Tools/Scripts/build-webkit --jsc-only
+ENV PATH=/root/WebKit/WebKitBuild/JSCOnly/Release/bin:$PATH
+
+
+# 6. Install SpiderMonkey
+
+WORKDIR /root
+
+# Clone Git
+RUN mkdir gecko-dev
+WORKDIR gecko-dev
+
+RUN git init
+RUN git remote add origin https://github.com/mozilla/gecko-dev.git
+RUN git fetch --depth=1 --no-tags origin 22ae5ab1f71c28f890438728de02f7419f5e2fdb
+RUN git reset --hard 22ae5ab1f71c28f890438728de02f7419f5e2fdb
+
+RUN echo '\
+# Build only the JS shell\n\
+ac_add_options --enable-project=js\n\
+\n\
+# Enable the debugging tools: Assertions, debug only code etc.\n\
+ac_add_options --enable-debug\n\
+\n\
+# Enable optimizations as well so that the test suite runs much faster. If\n\
+# you are having trouble using a debugger, you should disable optimization.\n\
+ac_add_options --enable-optimize\n\
+\n\
+# Use a dedicated objdir for SpiderMonkey debug builds to avoid\n\
+# conflicting with Firefox build with default configuration.\n\
+mk_add_options MOZ_OBJDIR=@TOPSRCDIR@/obj-debug-@CONFIG_GUESS@' > debug
+ENV MOZCONFIG=/root/gecko-dev/debug
+
+# Build
+RUN ./mach build
+
+WORKDIR /root/west/spectec
+RUN echo 'eval $(opam env)' >> ~/.bashrc

@@ -1,0 +1,19 @@
+(library
+  (name backend_test)
+  (libraries el il al xl il2al util backend_interpreter frontend unix threads)
+  (modules
+    flag
+    gen
+    patch
+    dynamic_patch
+    inject
+    utils
+    valid
+    conform_test
+    log
+    prune
+    top_down
+    bottom_up
+    langs
+    )
+)

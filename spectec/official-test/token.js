@@ -1,0 +1,500 @@
+
+'use strict';
+
+if (typeof console === 'undefined') {
+  var Console = function () {
+      this.log = function(msg) { debug(msg); };
+  };
+  var console = new Console();
+}
+
+let hostrefs = {};
+let hostsym = Symbol("hostref");
+function hostref(s) {
+  if (! (s in hostrefs)) hostrefs[s] = {[hostsym]: s};
+  return hostrefs[s];
+}
+function eq_ref(x, y) {
+  return x === y ? 1 : 0;
+}
+
+let spectest = {
+  hostref: hostref,
+  eq_ref: eq_ref,
+  print: console.log.bind(console),
+  print_i32: console.log.bind(console),
+  print_i64: console.log.bind(console),
+  print_i32_f32: console.log.bind(console),
+  print_f64_f64: console.log.bind(console),
+  print_f32: console.log.bind(console),
+  print_f64: console.log.bind(console),
+  global_i32: 666,
+  global_i64: 666n,
+  global_f32: 666.6,
+  global_f64: 666.6,
+  table: new WebAssembly.Table({initial: 10, maximum: 20, element: 'anyfunc'}),
+  memory: new WebAssembly.Memory({initial: 1, maximum: 2})
+};
+
+let handler = {
+  get(target, prop) {
+    return (prop in target) ?  target[prop] : {};
+  }
+};
+let registry = new Proxy({spectest}, handler);
+
+function register(name, instance) {
+  registry[name] = instance.exports;
+}
+
+function module(bytes, valid = true) {
+  let buffer = new ArrayBuffer(bytes.length);
+  let view = new Uint8Array(buffer);
+  for (let i = 0; i < bytes.length; ++i) {
+    view[i] = bytes.charCodeAt(i);
+  }
+  let validated;
+  try {
+    validated = WebAssembly.validate(buffer);
+  } catch (e) {
+    throw new Error("Wasm validate throws");
+  }
+  if (validated !== valid) {
+    if (!validated) WebAssembly.compile(buffer).catch(e => console.log(e));
+    throw new Error("Wasm validate failure" + (valid ? "" : " expected"));
+  }
+  return new WebAssembly.Module(buffer);
+}
+
+function instance(mod, imports = registry) {
+  return new WebAssembly.Instance(mod, imports);
+}
+
+function call(instance, name, args) {
+  return instance.exports[name](...args);
+}
+
+function get(instance, name) {
+  let v = instance.exports[name];
+  return (v instanceof WebAssembly.Global) ? v.value : v;
+}
+
+function exports(instance) {
+  return {module: instance.exports, spectest: spectest};
+}
+
+function run(action) {
+  action();
+}
+
+function assert_malformed(bytes) {
+  try { module(bytes, false) } catch (e) {
+    if (e instanceof WebAssembly.CompileError) return;
+  }
+  throw new Error("Wasm decoding failure expected");
+}
+
+function assert_malformed_custom(bytes) {
+  return;
+}
+
+function assert_invalid(bytes) {
+  try { module(bytes, false) } catch (e) {
+    if (e instanceof WebAssembly.CompileError) return;
+  }
+  throw new Error("Wasm validation failure expected");
+}
+
+function assert_invalid_custom(bytes) {
+  return;
+}
+
+function assert_unlinkable(mod) {
+  try { new WebAssembly.Instance(mod, registry) } catch (e) {
+    if (e instanceof WebAssembly.LinkError) return;
+  }
+  throw new Error("Wasm linking failure expected");
+}
+
+function assert_uninstantiable(mod) {
+  try { new WebAssembly.Instance(mod, registry) } catch (e) {
+    if (e instanceof WebAssembly.RuntimeError) return;
+    throw new Error("Wasm trap expected, but got: " + e);
+  }
+  throw new Error("Wasm trap expected");
+}
+
+function assert_uninstantiable_inlined(bytes) {
+  let mod = module(bytes);
+  assert_uninstantiable(mod);
+}
+
+function assert_trap(action) {
+  try { action() } catch (e) {
+    if (e instanceof WebAssembly.RuntimeError) return;
+    throw new Error("Wasm trap expected, but got: " + e);
+  }
+  throw new Error("Wasm trap expected");
+}
+
+function assert_exception(action) {
+  try { action() } catch (e) { return; }
+  throw new Error("exception expected");
+}
+
+let StackOverflow;
+try { (function f() { 1 + f() })() } catch (e) { StackOverflow = e.constructor }
+
+function assert_exhaustion(action) {
+  try { action() } catch (e) {
+    if (e instanceof StackOverflow) return;
+  }
+  throw new Error("Wasm resource exhaustion expected");
+}
+
+function assert_return(action, ...expected) {
+  let actual = action();
+  if (actual === undefined) {
+    actual = [];
+  } else if (!Array.isArray(actual)) {
+    actual = [actual];
+  }
+  if (actual.length !== expected.length) {
+    throw new Error(expected.length + " value(s) expected, got " + actual.length);
+  }
+  for (let i = 0; i < actual.length; ++i) {
+    switch (expected[i]) {
+      case "nan:canonical":
+      case "nan:arithmetic":
+      case "nan:any":
+        // Note that JS can't reliably distinguish different NaN values,
+        // so there's no good way to test that it's a canonical NaN.
+        if (!Number.isNaN(actual[i])) {
+          throw new Error("Wasm NaN return value expected, got " + actual[i]);
+        };
+        return;
+      case "ref.i31":
+        if (typeof actual[i] !== "number" || (actual[i] & 0x7fffffff) !== actual[i]) {
+          throw new Error("Wasm i31 return value expected, got " + actual[i]);
+        };
+        return;
+      case "ref.any":
+      case "ref.eq":
+      case "ref.struct":
+      case "ref.array":
+        // For now, JS can't distinguish exported Wasm GC values,
+        // so we only test for object.
+        if (typeof actual[i] !== "object") {
+          throw new Error("Wasm object return value expected, got " + actual[i]);
+        };
+        return;
+      case "ref.func":
+        if (typeof actual[i] !== "function") {
+          throw new Error("Wasm function return value expected, got " + actual[i]);
+        };
+        return;
+      case "ref.extern":
+        if (actual[i] === null) {
+          throw new Error("Wasm reference return value expected, got " + actual[i]);
+        };
+        return;
+      case "ref.null":
+        if (actual[i] !== null) {
+          throw new Error("Wasm null return value expected, got " + actual[i]);
+        };
+        return;
+      default:
+        if (!Object.is(actual[i], expected[i])) {
+          throw new Error("Wasm return value " + expected[i] + " expected, got " + actual[i]);
+        };
+    }
+  }
+}
+
+// token.wast:3
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// token.wast:7
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// token.wast:15
+let $$1 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x84\x80\x80\x80\x00\x01\x60\x00\x00\x03\x82\x80\x80\x80\x00\x01\x00\x0a\x89\x80\x80\x80\x00\x01\x83\x80\x80\x80\x00\x00\x01\x0b");
+
+// token.wast:15
+let $1 = instance($$1);
+
+// token.wast:18
+let $$2 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x84\x80\x80\x80\x00\x01\x60\x00\x00\x03\x82\x80\x80\x80\x00\x01\x00\x0a\x8a\x80\x80\x80\x00\x01\x84\x80\x80\x80\x00\x00\x01\x01\x0b");
+
+// token.wast:18
+let $2 = instance($$2);
+
+// token.wast:21
+let $$3 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x84\x80\x80\x80\x00\x01\x60\x00\x00\x03\x82\x80\x80\x80\x00\x01\x00\x0a\x8a\x80\x80\x80\x00\x01\x84\x80\x80\x80\x00\x00\x01\x01\x0b");
+
+// token.wast:21
+let $3 = instance($$3);
+
+// token.wast:24
+let $$4 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x84\x80\x80\x80\x00\x01\x60\x00\x00\x03\x82\x80\x80\x80\x00\x01\x00\x0a\x8a\x80\x80\x80\x00\x01\x84\x80\x80\x80\x00\x00\x01\x01\x0b");
+
+// token.wast:24
+let $4 = instance($$4);
+
+// token.wast:27
+let $$5 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x84\x80\x80\x80\x00\x01\x60\x00\x00\x03\x82\x80\x80\x80\x00\x01\x00\x0a\x89\x80\x80\x80\x00\x01\x83\x80\x80\x80\x00\x00\x01\x0b");
+
+// token.wast:27
+let $5 = instance($$5);
+
+// token.wast:30
+let $$6 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x84\x80\x80\x80\x00\x01\x60\x00\x00\x03\x82\x80\x80\x80\x00\x01\x00\x0a\x8b\x80\x80\x80\x00\x01\x85\x80\x80\x80\x00\x00\x0c\x00\x01\x0b");
+
+// token.wast:30
+let $6 = instance($$6);
+
+// token.wast:33
+let $$7 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x84\x80\x80\x80\x00\x01\x60\x00\x00\x03\x82\x80\x80\x80\x00\x01\x00\x04\x84\x80\x80\x80\x00\x01\x70\x00\x01\x09\x87\x80\x80\x80\x00\x01\x00\x41\x00\x0b\x01\x00\x0a\x88\x80\x80\x80\x00\x01\x82\x80\x80\x80\x00\x00\x0b");
+
+// token.wast:33
+let $7 = instance($$7);
+
+// token.wast:38
+let $$8 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x84\x80\x80\x80\x00\x01\x60\x00\x00\x03\x82\x80\x80\x80\x00\x01\x00\x04\x84\x80\x80\x80\x00\x01\x70\x00\x01\x09\x87\x80\x80\x80\x00\x01\x00\x41\x00\x0b\x01\x00\x0a\x88\x80\x80\x80\x00\x01\x82\x80\x80\x80\x00\x00\x0b");
+
+// token.wast:38
+let $8 = instance($$8);
+
+// token.wast:43
+let $$9 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x05\x83\x80\x80\x80\x00\x01\x00\x01\x0b\x87\x80\x80\x80\x00\x01\x00\x41\x00\x0b\x01\x61");
+
+// token.wast:43
+let $9 = instance($$9);
+
+// token.wast:47
+let $$10 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x84\x80\x80\x80\x00\x01\x60\x00\x00\x02\x92\x80\x80\x80\x00\x01\x08\x73\x70\x65\x63\x74\x65\x73\x74\x05\x70\x72\x69\x6e\x74\x00\x00");
+
+// token.wast:47
+let $10 = instance($$10);
+
+// token.wast:54
+let $$11 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x84\x80\x80\x80\x00\x01\x60\x00\x00\x03\x82\x80\x80\x80\x00\x01\x00\x0a\x88\x80\x80\x80\x00\x01\x82\x80\x80\x80\x00\x00\x0b");
+
+// token.wast:54
+let $11 = instance($$11);
+
+// token.wast:58
+let $$12 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x84\x80\x80\x80\x00\x01\x60\x00\x00\x03\x82\x80\x80\x80\x00\x01\x00\x0a\x89\x80\x80\x80\x00\x01\x83\x80\x80\x80\x00\x00\x01\x0b");
+
+// token.wast:58
+let $12 = instance($$12);
+
+// token.wast:62
+let $$13 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x84\x80\x80\x80\x00\x01\x60\x00\x00\x03\x82\x80\x80\x80\x00\x01\x00\x0a\x89\x80\x80\x80\x00\x01\x83\x80\x80\x80\x00\x00\x01\x0b");
+
+// token.wast:62
+let $13 = instance($$13);
+
+// token.wast:66
+let $$14 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x84\x80\x80\x80\x00\x01\x60\x00\x00\x03\x82\x80\x80\x80\x00\x01\x00\x0a\x88\x80\x80\x80\x00\x01\x82\x80\x80\x80\x00\x00\x0b");
+
+// token.wast:66
+let $14 = instance($$14);
+
+// token.wast:70
+let $$15 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x84\x80\x80\x80\x00\x01\x60\x00\x00\x03\x82\x80\x80\x80\x00\x01\x00\x0a\x8a\x80\x80\x80\x00\x01\x84\x80\x80\x80\x00\x00\x0c\x00\x0b");
+
+// token.wast:70
+let $15 = instance($$15);
+
+// token.wast:74
+let $$16 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x0b\x84\x80\x80\x80\x00\x01\x01\x01\x61");
+
+// token.wast:74
+let $16 = instance($$16);
+
+// token.wast:82
+let $$17 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x84\x80\x80\x80\x00\x01\x60\x00\x00\x03\x82\x80\x80\x80\x00\x01\x00\x0a\x91\x80\x80\x80\x00\x01\x8b\x80\x80\x80\x00\x00\x02\x40\x41\x00\x0e\x01\x00\x00\x0b\x0b");
+
+// token.wast:82
+let $17 = instance($$17);
+
+// token.wast:85
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// token.wast:91
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// token.wast:98
+let $$18 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x84\x80\x80\x80\x00\x01\x60\x00\x00\x03\x82\x80\x80\x80\x00\x01\x00\x0a\x91\x80\x80\x80\x00\x01\x8b\x80\x80\x80\x00\x00\x02\x40\x41\x00\x0e\x01\x00\x00\x0b\x0b");
+
+// token.wast:98
+let $18 = instance($$18);
+
+// token.wast:101
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// token.wast:107
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// token.wast:114
+let $$19 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x84\x80\x80\x80\x00\x01\x60\x00\x00\x03\x82\x80\x80\x80\x00\x01\x00\x0a\x91\x80\x80\x80\x00\x01\x8b\x80\x80\x80\x00\x00\x02\x40\x41\x00\x0e\x01\x00\x00\x0b\x0b");
+
+// token.wast:114
+let $19 = instance($$19);
+
+// token.wast:117
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// token.wast:123
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// token.wast:130
+let $$20 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x84\x80\x80\x80\x00\x01\x60\x00\x00\x03\x82\x80\x80\x80\x00\x01\x00\x0a\x90\x80\x80\x80\x00\x01\x8a\x80\x80\x80\x00\x00\x02\x40\x41\x00\x0e\x00\x00\x0b\x0b");
+
+// token.wast:130
+let $20 = instance($$20);
+
+// token.wast:133
+let $$21 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x84\x80\x80\x80\x00\x01\x60\x00\x00\x03\x82\x80\x80\x80\x00\x01\x00\x0a\x90\x80\x80\x80\x00\x01\x8a\x80\x80\x80\x00\x00\x02\x40\x41\x00\x0e\x00\x00\x0b\x0b");
+
+// token.wast:133
+let $21 = instance($$21);
+
+// token.wast:140
+let $$22 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x0b\x84\x80\x80\x80\x00\x01\x01\x01\x61");
+
+// token.wast:140
+let $22 = instance($$22);
+
+// token.wast:143
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// token.wast:150
+let $$23 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x0b\x84\x80\x80\x80\x00\x01\x01\x01\x61");
+
+// token.wast:150
+let $23 = instance($$23);
+
+// token.wast:153
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// token.wast:160
+let $$24 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x0b\x85\x80\x80\x80\x00\x01\x01\x02\x20\x61");
+
+// token.wast:160
+let $24 = instance($$24);
+
+// token.wast:163
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// token.wast:170
+let $$25 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x0b\x85\x80\x80\x80\x00\x01\x01\x02\x61\x20");
+
+// token.wast:170
+let $25 = instance($$25);
+
+// token.wast:173
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// token.wast:180
+let $$26 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x0b\x86\x80\x80\x80\x00\x01\x01\x03\x61\x20\x62");
+
+// token.wast:180
+let $26 = instance($$26);
+
+// token.wast:183
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// token.wast:190
+let $$27 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x0b\x89\x80\x80\x80\x00\x01\x01\x06\xef\x98\x9a\xef\x92\xa9");
+
+// token.wast:190
+let $27 = instance($$27);
+
+// token.wast:193
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// token.wast:200
+let $$28 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x0b\x8a\x80\x80\x80\x00\x01\x01\x07\x20\xef\x98\x9a\xef\x92\xa9");
+
+// token.wast:200
+let $28 = instance($$28);
+
+// token.wast:203
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// token.wast:210
+let $$29 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x0b\x8a\x80\x80\x80\x00\x01\x01\x07\xef\x98\x9a\xef\x92\xa9\x20");
+
+// token.wast:210
+let $29 = instance($$29);
+
+// token.wast:213
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// token.wast:220
+let $$30 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x0b\x85\x80\x80\x80\x00\x01\x01\x02\x61\x62");
+
+// token.wast:220
+let $30 = instance($$30);
+
+// token.wast:223
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// token.wast:230
+let $$31 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x0b\x86\x80\x80\x80\x00\x01\x01\x03\x61\x20\x62");
+
+// token.wast:230
+let $31 = instance($$31);
+
+// token.wast:233
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// token.wast:240
+let $$32 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x0b\x86\x80\x80\x80\x00\x01\x01\x03\x61\x20\x62");
+
+// token.wast:240
+let $32 = instance($$32);
+
+// token.wast:243
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// token.wast:250
+let $$33 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x0b\x8f\x80\x80\x80\x00\x01\x01\x0c\xef\x98\x9a\xef\x92\xa9\xef\x98\x9a\xef\x92\xa9");
+
+// token.wast:250
+let $33 = instance($$33);
+
+// token.wast:253
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// token.wast:260
+let $$34 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x0b\x90\x80\x80\x80\x00\x01\x01\x0d\xef\x98\x9a\xef\x92\xa9\x20\xef\x98\x9a\xef\x92\xa9");
+
+// token.wast:260
+let $34 = instance($$34);
+
+// token.wast:263
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// token.wast:270
+let $$35 = module("\x00\x61\x73\x6d\x01\x00\x00\x00\x0b\x90\x80\x80\x80\x00\x01\x01\x0d\xef\x98\x9a\xef\x92\xa9\x20\xef\x98\x9a\xef\x92\xa9");
+
+// token.wast:270
+let $35 = instance($$35);
+
+// token.wast:273
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// token.wast:281
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// token.wast:287
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// token.wast:293
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");
+
+// token.wast:299
+assert_malformed("\x3c\x6d\x61\x6c\x66\x6f\x72\x6d\x65\x64\x20\x71\x75\x6f\x74\x65\x3e");

@@ -1,0 +1,15 @@
+(module
+  (table $t i32 1 anyref ;; or eqref
+    ;;(i32.const 262135)
+    (i32.const 262136)
+    (ref.i31)
+  )
+  (func (export "f")
+    (i32.const 0)
+    ;;(i32.const 262135)
+    (i32.const 262136)
+    (ref.i31)
+    (table.set $t)
+  )
+)
+(assert_return (invoke "f"))
